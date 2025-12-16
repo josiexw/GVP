@@ -37,6 +37,9 @@ save("obs_img.png", obs_img);
 ##         RANSAC + Drift MH         ##
 #######################################
 using Gen, ImageCore, Plots
+using Statistics
+using LinearAlgebra
+using Images
 
 _to_chw3(a) = begin
     if a isa AbstractMatrix{<:Colorant}
@@ -49,28 +52,109 @@ _to_chw3(a) = begin
     end
 end
 
-struct ImageGaussian <: Gen.Distribution{Any} end
-const image_gaussian = ImageGaussian()
-
-Gen.logpdf(::ImageGaussian, y, renderer::Function, sig::Real) = begin
-    mu = _to_chw3(renderer())
-    yy = _to_chw3(y)
-
-    Hμ, Wμ = size(mu,2), size(mu,3)
-    Hy, Wy = size(yy,2), size(yy,3)
-    H = min(Hμ, Hy); W = min(Wμ, Wy)
-    mu = @view mu[:, 1:H, 1:W]
-    yy = @view yy[:, 1:H, 1:W]
-
-    s2 = sig^2
-    n  = length(yy)
-    -0.5f0*n*log(2f0*Float32(pi)*s2) - sum(abs2, yy .- mu) / (2f0*s2)
+function img_to_gray_array(img)
+    Float32.(channelview(Gray.(img)))
 end
 
-Gen.random(::ImageGaussian, renderer::Function, sig::Real) = renderer()
-Gen.has_output_grad(::ImageGaussian) = false
-Gen.has_argument_grads(::ImageGaussian) = (false, false)
-Gen.is_discrete(::ImageGaussian) = false
+function edge_mask(img; thresh::Real=0.5)
+    gray = img_to_gray_array(img)
+    BitMatrix(gray .< thresh)
+end
+
+function edge_coords(edges::BitMatrix)
+    idxs = findall(edges)
+    n = length(idxs)
+    xs = Array{Float64}(undef, n)
+    ys = Array{Float64}(undef, n)
+    for (i, idx) in enumerate(idxs)
+        ys[i] = idx[1]
+        xs[i] = idx[2]
+    end
+    hcat(xs, ys)
+end
+
+function normalize_points(pts::AbstractMatrix{<:Real})
+    if size(pts, 1) == 0
+        return Array{Float64}(undef, 0, 2)
+    end
+    ptsf = Array{Float64}(pts)
+    μ = vec(mean(ptsf, dims=1))
+    pts0 = ptsf .- μ'
+    r = maximum(sqrt.(sum(abs2, pts0; dims=2)))
+    if r == 0.0
+        return pts0
+    end
+    pts0 ./ r
+end
+
+function chamfer_distance(obs_edges::BitMatrix, pred_edges::BitMatrix)
+    As_raw = edge_coords(obs_edges)
+    Bs_raw = edge_coords(pred_edges)
+
+    if size(As_raw, 1) == 0 && size(Bs_raw, 1) == 0
+        return 0.0
+    elseif size(As_raw, 1) == 0 || size(Bs_raw, 1) == 0
+        return Inf
+    end
+
+    As = normalize_points(As_raw)
+    Bs = normalize_points(Bs_raw)
+
+    dA = 0.0
+    for i in 1:size(As, 1)
+        ax = As[i, 1]
+        ay = As[i, 2]
+        min_d2 = Inf
+        for j in 1:size(Bs, 1)
+            bx = Bs[j, 1]
+            by = Bs[j, 2]
+            dx = ax - bx
+            dy = ay - by
+            d2 = dx*dx + dy*dy
+            if d2 < min_d2
+                min_d2 = d2
+            end
+        end
+        dA += sqrt(min_d2)
+    end
+    dA /= size(As, 1)
+
+    dB = 0.0
+    for j in 1:size(Bs, 1)
+        bx = Bs[j, 1]
+        by = Bs[j, 2]
+        min_d2 = Inf
+        for i in 1:size(As, 1)
+            ax = As[i, 1]
+            ay = As[i, 2]
+            dx = bx - ax
+            dy = by - ay
+            d2 = dx*dx + dy*dy
+            if d2 < min_d2
+                min_d2 = d2
+            end
+        end
+        dB += sqrt(min_d2)
+    end
+    dB /= size(Bs, 1)
+
+    (dA + dB) / 2
+end
+
+struct ImageChamfer <: Gen.Distribution{Any} end
+const image_chamfer = ImageChamfer()
+
+Gen.logpdf(::ImageChamfer, y, renderer::Function, sig::Real) = begin
+    obs_edges = edge_mask(y)
+    pred_edges = edge_mask(renderer())
+    D = chamfer_distance(obs_edges, pred_edges)
+    isfinite(D) ? -(D^2) / (2 * sig) : -Inf
+end
+
+Gen.random(::ImageChamfer, renderer::Function, sig::Real) = renderer()
+Gen.has_output_grad(::ImageChamfer) = false
+Gen.has_argument_grads(::ImageChamfer) = (false, false)
+Gen.is_discrete(::ImageChamfer) = false
 
 @gen function wireframe_camera_model(vertices, edges, width::Int, height::Int, sig::Real)
     az ~ uniform_continuous(0, 2*pi)
@@ -82,7 +166,7 @@ Gen.is_discrete(::ImageGaussian) = false
         img
     end
 
-    {:img} ~ image_gaussian(renderer, sig)
+    {:img} ~ image_chamfer(renderer, sig)
     return (az, el)
 end
 
@@ -95,7 +179,7 @@ function view_loglik(vertices, edges, obs_img;
                                         azimuth=az, elevation=el)
         img
     end
-    Gen.logpdf(image_gaussian, obs_img, renderer, sig)
+    Gen.logpdf(image_chamfer, obs_img, renderer, sig)
 end
 
 function camera_ransac(vertices, edges, obs_img;
@@ -194,3 +278,6 @@ tr = ransac_inference(V, E, obs_img; width=256, height=256, sig=0.05, steps=500)
 println("Estimated azimuth:", tr[:az]);
 println("Estimated elevation:", tr[:el]);
 animate_drift(tr; steps=500, path="vis.gif", fps=20);
+
+println("Best pose log-likelihood: ",
+        view_loglik(V, E, obs_img; width=256, height=256, sig=0.05, az=tr[:az], el=tr[:el]));
